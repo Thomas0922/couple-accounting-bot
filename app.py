@@ -153,7 +153,8 @@ def handle_message(event):
     # Group 1 (Optional): 日期 (2023-12-01 或 12/01)
     # Group 2: 文字內容 (可能是 "項目" 或 "名字 項目")
     # Group 3: 金額
-    pattern = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(.+?)\s+(\d+)$'
+    # 修改：允許項目與金額之間、日期與項目之間不加空格 (\s* 取代 \s+)
+    pattern = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)$'
     match = re.match(pattern, msg)
     
     if match:
