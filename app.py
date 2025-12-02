@@ -1,4 +1,3 @@
-import os
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -6,35 +5,45 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 從環境變數讀取設定 (這些等一下在 Render 設定)
-line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
-handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
+# 直接寫死 (測試用)
+LINE_CHANNEL_ACCESS_TOKEN = '6oJDYrICLrhln85HORAK8hOV7UxNekI7ZeUfVAz7hqZrphXddV/Jwc1077WEvpA9nhHTYP21yIUFOkr3QGKgUeYrlT5WbdgvtS0WUjt7dATVb1iypghur/v35+PPeHVOf+Ekgs5gCbqHzDzHMTqSHQdB04t89/1O/w1cDnyilFU='
+LINE_CHANNEL_SECRET = '6b6f99c9fa7b90df0c8cea5496384410'
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     
-    # 加入這兩行 Debug (看 Render 的 Logs 顯示什麼)
-    channel_secret = os.environ.get('LINE_CHANNEL_SECRET')
-    print(f"DEBUG: My Secret is: {channel_secret}", flush=True)  # 檢查讀到了什麼
-    print(f"DEBUG: Body length: {len(body)}", flush=True)
-
+    app.logger.info(f"Request body: {body}")
+    app.logger.info(f"Signature: {signature}")
+    
     try:
         handler.handle(body, signature)
-    # ... (後面照舊)
     except InvalidSignatureError:
+        app.logger.error("Invalid signature. Check your channel secret.")
         abort(400)
+    except Exception as e:
+        app.logger.error(f"Error: {str(e)}")
+        abort(500)
+    
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    # 回聲測試：你說什麼，機器人就回什麼
     msg = event.message.text
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=f"收到：{msg}")
     )
 
+@app.route("/", methods=['GET'])
+def health_check():
+    return "Bot is running!", 200
+
 if __name__ == "__main__":
-    app.run()
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
