@@ -276,71 +276,25 @@ def handle_message(event):
                 total_all += amt
                 spending_map[uid] = spending_map.get(uid, 0) + amt
                 
-                # 格式化日期 (MM/DD)
-                date_str = dt.strftime("%m/%d")
+                # 格式化日期時間 (MM/DD HH:MM)
+                date_str = dt.strftime("%m/%d %H:%M")
                 name = user_map.get(uid, get_user_name(uid))
                 
                 reply_text += f"{date_str} {name}: {item} ${amt}\n"
             
             reply_text += "----------------\n"
             reply_text += f"💰 總支出: ${total_all}\n"
-            reply_text += "📊 統計與分帳：\n"
             
             # 確保分母包含所有註冊用戶
             for uid in user_map:
                 if uid not in spending_map:
                     spending_map[uid] = 0
 
-            user_count = len(spending_map)
-            
-            # === 分帳邏輯 ===
-            if user_count > 1:
-                average = int(total_all / user_count)
-                reply_text += f"🔢 平均每人: ${average}\n\n"
-                
-                balances = []
-                for uid, amt in spending_map.items():
-                    diff = amt - average
-                    balances.append({'uid': uid, 'diff': diff})
-                    name = user_map.get(uid, "未知")
-                    reply_text += f"{name} 已付: ${amt}\n"
-                
-                balances.sort(key=lambda x: x['diff'], reverse=True)
-                
-                transfer_text = "\n💸 建議轉帳：\n"
-                i = 0 
-                j = len(balances) - 1
-                has_transfer = False
-
-                while i < j:
-                    creditor = balances[i]
-                    debtor = balances[j]
-                    
-                    if int(creditor['diff']) == 0:
-                        i += 1
-                        continue
-                    if int(debtor['diff']) == 0:
-                        j -= 1
-                        continue
-                    
-                    amount = min(creditor['diff'], -debtor['diff'])
-                    amount_int = int(amount)
-                    
-                    if amount_int > 0:
-                        debtor_name = user_map.get(debtor['uid'], "未知")
-                        creditor_name = user_map.get(creditor['uid'], "未知")
-                        transfer_text += f"👉 {debtor_name} 給 {creditor_name} ${amount_int}\n"
-                        has_transfer = True
-                    
-                    balances[i]['diff'] -= amount
-                    balances[j]['diff'] += amount
-                
-                if not has_transfer:
-                    transfer_text += "目前款項已平衡！"
-                
-                reply_text += transfer_text
-            else:
-                reply_text += f"\n(目前只有 1 位用戶參與記帳，無法分帳)"
+            # === 各人統計 (移除平均與建議) ===
+            reply_text += "👤 各人統計：\n"
+            for uid, amt in spending_map.items():
+                name = user_map.get(uid, get_user_name(uid))
+                reply_text += f"{name}: ${amt}\n"
 
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
