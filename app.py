@@ -166,6 +166,11 @@ def handle_message(event):
     msg = event.message.text.strip()
     sender_id = event.source.user_id
 
+    # === 功能：小彩蛋 ===
+    if msg == "我愛你":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我也愛你們爸爸媽媽 ❤️"))
+        return
+
     # === 功能：顯示說明指令 ===
     if msg in ["說明", "指令", "help", "Help"]:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
@@ -345,7 +350,7 @@ def handle_message(event):
             cur.close()
             conn.close()
             
-            reply_msg = f"✅ 已記錄！\n📅 時間：{display_date}\n👤 付款：{final_user_name}\n🛒 項目：{item}\n💰 金額：${amount}"
+            reply_msg = f"✅ 記帳成功！\n👤 付款：{final_user_name}\n🛒 項目：{item}\n💰 金額：${amount}"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
             
         except Exception as e:
