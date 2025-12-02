@@ -2,6 +2,7 @@ import os
 import re
 import psycopg2
 import logging
+from datetime import datetime
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -58,9 +59,9 @@ def init_db():
 with app.app_context():
     init_db()
 
-# === 4. 輔助函式：取得用戶顯示名稱 ===
+# === 4. 輔助函式 ===
+# 取得用戶顯示名稱 (User ID -> Name)
 def get_user_name(user_id):
-    # 1. 先從資料庫找 (優先使用使用者自己設定的名字)
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -72,13 +73,28 @@ def get_user_name(user_id):
             return result[0]
     except Exception as e:
         app.logger.error(f"查詢使用者名稱失敗: {e}")
-
-    # 2. 如果資料庫沒有，嘗試問 LINE (如果沒加好友可能會失敗)
+    
+    # 資料庫沒有，試著問 LINE
     try:
         profile = line_bot_api.get_profile(user_id)
         return profile.display_name
     except:
         return f"用戶({user_id[:4]})"
+
+# 取得用戶 ID (Name -> User ID) - 用於「幫別人記帳」
+def get_user_id_by_name(name):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE display_name = %s", (name,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        if result:
+            return result[0]
+    except Exception as e:
+        app.logger.error(f"查詢 ID 失敗: {e}")
+    return None
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -98,7 +114,7 @@ def callback():
 def handle_join(event):
     welcome_msg = (
         "大家好！我是情侶記帳小幫手 ❤️\n"
-        "為了顯示正確的名字，請大家先告訴我你是誰。\n\n"
+        "為了讓功能正常運作，請大家先告訴我你是誰。\n\n"
         "請輸入：我是 你的名字\n"
         "例如：我是 老公"
     )
@@ -107,7 +123,7 @@ def handle_join(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     msg = event.message.text.strip()
-    user_id = event.source.user_id
+    sender_id = event.source.user_id
     
     # === 功能 A：註冊名字 (格式：我是 xxx) ===
     if msg.startswith("我是"):
@@ -116,81 +132,220 @@ def handle_message(event):
             try:
                 conn = get_db_connection()
                 cur = conn.cursor()
-                # 使用 UPSERT (有就更新，沒有就新增)
+                # 使用 UPSERT
                 cur.execute("""
                     INSERT INTO users (user_id, display_name) 
                     VALUES (%s, %s)
                     ON CONFLICT (user_id) 
                     DO UPDATE SET display_name = EXCLUDED.display_name;
-                """, (user_id, name))
+                """, (sender_id, name))
                 conn.commit()
                 cur.close()
                 conn.close()
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 歡迎 {name}！名字設定成功！"))
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 歡迎 {name}！已記住你的名字。"))
             except Exception as e:
                 app.logger.error(f"設定名字失敗: {e}")
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 設定失敗，請稍後再試。"))
         return
 
-    # === 功能 B：記帳 (格式：項目 金額) ===
-    match = re.match(r'^(.+?)\s+(\d+)$', msg)
+    # === 功能 B：記帳 (智慧判斷：自己 or 幫別人) ===
+    # Regex 解析：
+    # Group 1 (Optional): 日期 (2023-12-01 或 12/01)
+    # Group 2: 文字內容 (可能是 "項目" 或 "名字 項目")
+    # Group 3: 金額
+    pattern = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(.+?)\s+(\d+)$'
+    match = re.match(pattern, msg)
+    
     if match:
-        item = match.group(1)
-        amount = int(match.group(2))
+        date_str = match.group(1)
+        text_content = match.group(2).strip()
+        amount = int(match.group(3))
         
+        # 1. 判斷是「記自己」還是「幫別人」
+        # 我們把 text_content 拆開來看第一個詞是不是人名
+        # 例如：text_content = "老公 飲料" -> tokens = ["老公", "飲料"]
+        tokens = text_content.split(None, 1)
+        
+        final_user_id = sender_id
+        item = text_content # 預設整個文字都是項目 (例如: "珍珠 奶茶")
+        
+        # 如果 text_content 包含空格 (有兩個以上的詞)
+        if len(tokens) == 2:
+            possible_name = tokens[0]
+            remaining_text = tokens[1]
+            
+            # 查查看第一個詞是不是已註冊的名字
+            found_id = get_user_id_by_name(possible_name)
+            if found_id:
+                final_user_id = found_id
+                item = remaining_text # 項目就是剩下的字
+                # 找到了！這就是「幫別人記」模式
+            else:
+                # 沒找到名字，那就代表這只是普通的項目名稱 (例如: "珍珠 奶茶")
+                pass
+
+        # 2. 決定時間 (指定日期 or 自動現在)
+        created_at_val = "now()" # 預設為 SQL 的 now()，自動記錄當下
+        display_date = "今天"
+        
+        if date_str:
+            try:
+                # 嘗試解析日期
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                created_at_val = f"'{date_str} 12:00:00'" 
+                display_date = date_str
+            except ValueError:
+                # 如果日期格式不對，視為普通文字記帳失敗? 或是提示? 
+                # 這裡簡單回覆提示
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 日期格式請用 YYYY-MM-DD"))
+                return
+
+        # 3. 寫入資料庫
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO expenses (user_id, item, amount) VALUES (%s, %s, %s)",
-                (user_id, item, amount)
-            )
+            
+            if created_at_val == "now()":
+                cur.execute(
+                    "INSERT INTO expenses (user_id, item, amount) VALUES (%s, %s, %s)",
+                    (final_user_id, item, amount)
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO expenses (user_id, item, amount, created_at) VALUES (%s, %s, %s, %s)",
+                    (final_user_id, item, amount, date_str)
+                )
+                
             conn.commit()
+            
+            # 取得顯示用的名字
+            final_user_name = get_user_name(final_user_id)
+            if final_user_id == sender_id:
+                final_user_name = "你" 
+
             cur.close()
             conn.close()
             
-            # 取得用戶名稱
-            user_name = get_user_name(user_id)
-            reply_text = f"✅ {user_name} 記帳成功！\n項目：{item}\n金額：${amount}"
+            reply_msg = f"✅ 已記錄！\n📅 時間：{display_date}\n👤 付款：{final_user_name}\n🛒 項目：{item}\n💰 金額：${amount}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+            
         except Exception as e:
             app.logger.error(f"Database Error: {e}")
-            reply_text = "❌ 記帳失敗，資料庫連線可能有問題。"
-            
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 記帳失敗，資料庫出錯了。"))
         return
 
-    # === 功能 C：查詢結算 (指令：結算) ===
+    # === 功能 C：查詢結算 (列出明細 + 統計) ===
     if msg == "結算":
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT user_id, SUM(amount) FROM expenses GROUP BY user_id")
-            rows = cur.fetchall()
+            
+            # 1. 撈取詳細明細 (依時間排序)
+            cur.execute("""
+                SELECT e.created_at, e.user_id, e.item, e.amount 
+                FROM expenses e 
+                ORDER BY e.created_at ASC
+            """)
+            details = cur.fetchall()
+            
+            # 2. 撈取所有用戶名
+            cur.execute("SELECT user_id, display_name FROM users")
+            users_raw = cur.fetchall()
+            user_map = {u[0]: u[1] for u in users_raw}
+            
             cur.close()
             conn.close()
             
-            if not rows:
-                reply_text = "目前還沒有任何消費紀錄喔！"
-            else:
-                reply_text = "📊 本期消費統計：\n"
-                total_all = 0
-                
-                for row in rows:
-                    target_user_id = row[0]
-                    total = row[1]
-                    total_all += total
-                    
-                    # 取得真實暱稱
-                    display_name = get_user_name(target_user_id)
-                    reply_text += f"{display_name}: ${total}\n"
-                
-                reply_text += f"----------------\n💰 總支出: ${total_all}"
-                    
-        except Exception as e:
-            app.logger.error(f"Database Error: {e}")
-            reply_text = "❌ 查詢失敗，請稍後再試。"
+            if not details:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前還沒有任何消費紀錄喔！"))
+                return
             
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            # === 產生詳細清單 ===
+            reply_text = "📝 消費明細：\n"
+            spending_map = {} # user_id -> total_amount
+            total_all = 0
+            
+            for row in details:
+                dt = row[0] # datetime object
+                uid = row[1]
+                item = row[2]
+                amt = row[3]
+                
+                # 累加總額
+                total_all += amt
+                spending_map[uid] = spending_map.get(uid, 0) + amt
+                
+                # 格式化日期 (MM/DD)
+                date_str = dt.strftime("%m/%d")
+                name = user_map.get(uid, get_user_name(uid))
+                
+                reply_text += f"{date_str} {name}: {item} ${amt}\n"
+            
+            reply_text += "----------------\n"
+            reply_text += f"💰 總支出: ${total_all}\n"
+            reply_text += "📊 統計與分帳：\n"
+            
+            # 確保分母包含所有註冊用戶
+            for uid in user_map:
+                if uid not in spending_map:
+                    spending_map[uid] = 0
+
+            user_count = len(spending_map)
+            
+            # === 分帳邏輯 ===
+            if user_count > 1:
+                average = int(total_all / user_count)
+                reply_text += f"🔢 平均每人: ${average}\n\n"
+                
+                balances = []
+                for uid, amt in spending_map.items():
+                    diff = amt - average
+                    balances.append({'uid': uid, 'diff': diff})
+                    name = user_map.get(uid, "未知")
+                    reply_text += f"{name} 已付: ${amt}\n"
+                
+                balances.sort(key=lambda x: x['diff'], reverse=True)
+                
+                transfer_text = "\n💸 建議轉帳：\n"
+                i = 0 
+                j = len(balances) - 1
+                has_transfer = False
+
+                while i < j:
+                    creditor = balances[i]
+                    debtor = balances[j]
+                    
+                    if int(creditor['diff']) == 0:
+                        i += 1
+                        continue
+                    if int(debtor['diff']) == 0:
+                        j -= 1
+                        continue
+                    
+                    amount = min(creditor['diff'], -debtor['diff'])
+                    amount_int = int(amount)
+                    
+                    if amount_int > 0:
+                        debtor_name = user_map.get(debtor['uid'], "未知")
+                        creditor_name = user_map.get(creditor['uid'], "未知")
+                        transfer_text += f"👉 {debtor_name} 給 {creditor_name} ${amount_int}\n"
+                        has_transfer = True
+                    
+                    balances[i]['diff'] -= amount
+                    balances[j]['diff'] += amount
+                
+                if not has_transfer:
+                    transfer_text += "目前款項已平衡！"
+                
+                reply_text += transfer_text
+            else:
+                reply_text += f"\n(目前只有 1 位用戶參與記帳，無法分帳)"
+
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+        except Exception as e:
+            app.logger.error(f"Error: {e}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 結算發生錯誤"))
         return
 
     # === 功能 D：清除所有資料 (指令：清除) ===
@@ -202,12 +357,9 @@ def handle_message(event):
             conn.commit()
             cur.close()
             conn.close()
-            reply_text = "🗑️ 已清除所有記帳資料！\n一切重新開始 ✨"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🗑️ 已清除所有記帳資料！\n一切重新開始 ✨"))
         except Exception as e:
-            app.logger.error(f"Database Error: {e}")
-            reply_text = "❌ 清除失敗。"
-            
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            app.logger.error(f"DB Error: {e}")
         return
 
 @app.route("/", methods=['GET'])
