@@ -14,8 +14,15 @@ handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
+    
+    # 加入這兩行 Debug (看 Render 的 Logs 顯示什麼)
+    channel_secret = os.environ.get('LINE_CHANNEL_SECRET')
+    print(f"DEBUG: My Secret is: {channel_secret}", flush=True)  # 檢查讀到了什麼
+    print(f"DEBUG: Body length: {len(body)}", flush=True)
+
     try:
         handler.handle(body, signature)
+    # ... (後面照舊)
     except InvalidSignatureError:
         abort(400)
     return 'OK'
