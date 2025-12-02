@@ -6,7 +6,7 @@ from datetime import datetime
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, FollowEvent
 
 # 設定 Log 顯示 (方便除錯)
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +20,30 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 # 初始化 Line Bot
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# === 定義歡迎訊息與指令說明 ===
+WELCOME_MSG = (
+    "👋 大家好！我是情侶記帳小幫手\n\n"
+    "✨ 初次見面請先註冊：\n"
+    "👉 輸入「我是 你的名字」\n"
+    "(例如：我是 老公)\n\n"
+    "📝 【指令大全】\n"
+    "1. 記自己 (最常用)：\n"
+    "   • 晚餐 200\n"
+    "   • 飲料50 (不用空格也行)\n\n"
+    "2. 自動拆帳 (新功能 ✨)：\n"
+    "   • 晚餐 400 幫 150\n"
+    "     (總額400，其中150幫對方付)\n"
+    "   • 晚餐 400 幫 老公 150\n\n"
+    "3. 幫對方記 (全額)：\n"
+    "   • 老公 飲料 50\n\n"
+    "4. 補舊帳：\n"
+    "   • 2023-12-01 午餐 150\n\n"
+    "5. 查詢與管理：\n"
+    "   • 結算：查看清單與總額\n"
+    "   • 清除：刪除資料重新開始\n"
+    "   • 說明：顯示此教學"
+)
 
 # === 2. 資料庫連線輔助函式 ===
 def get_db_connection():
@@ -81,7 +105,7 @@ def get_user_name(user_id):
     except:
         return f"用戶({user_id[:4]})"
 
-# 取得用戶 ID (Name -> User ID) - 用於「幫別人記帳」
+# 取得用戶 ID (Name -> User ID)
 def get_user_id_by_name(name):
     try:
         conn = get_db_connection()
@@ -96,6 +120,24 @@ def get_user_id_by_name(name):
         app.logger.error(f"查詢 ID 失敗: {e}")
     return None
 
+# 取得「另一半」的 ID (適合只有兩個人的時候)
+def get_partner_id(my_user_id):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # 找出除了自己以外的所有用戶
+        cur.execute("SELECT user_id, display_name FROM users WHERE user_id != %s", (my_user_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        # 只有當剩下正好 1 個人時，我們才能確定「另一半」是誰
+        if len(rows) == 1:
+            return rows[0][0], rows[0][1] # return ID, Name
+    except Exception as e:
+        app.logger.error(f"查詢另一半失敗: {e}")
+    return None, None
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
@@ -109,21 +151,25 @@ def callback():
         abort(400)
     return 'OK'
 
+# === 加入好友時的歡迎詞 (1對1) ===
+@handler.add(FollowEvent)
+def handle_follow(event):
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
+
 # === 加入群組時的歡迎詞 ===
 @handler.add(JoinEvent)
 def handle_join(event):
-    welcome_msg = (
-        "大家好！我是情侶記帳小幫手 ❤️\n"
-        "為了讓功能正常運作，請大家先告訴我你是誰。\n\n"
-        "請輸入：我是 你的名字\n"
-        "例如：我是 老公"
-    )
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome_msg))
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     msg = event.message.text.strip()
     sender_id = event.source.user_id
+
+    # === 功能：顯示說明指令 ===
+    if msg in ["說明", "指令", "help", "Help"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
+        return
     
     # === 功能 A：註冊名字 (格式：我是 xxx) ===
     if msg.startswith("我是"):
@@ -148,56 +194,129 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 設定失敗，請稍後再試。"))
         return
 
-    # === 功能 B：記帳 (智慧判斷：自己 or 幫別人) ===
-    # Regex 解析：
-    # Group 1 (Optional): 日期 (2023-12-01 或 12/01)
-    # Group 2: 文字內容 (可能是 "項目" 或 "名字 項目")
-    # Group 3: 金額
-    # 修改：允許項目與金額之間、日期與項目之間不加空格 (\s* 取代 \s+)
-    pattern = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)$'
-    match = re.match(pattern, msg)
+    # === 功能 B：自動拆帳 (優先判斷) ===
+    # 格式1 (指定對象)：[日期] [項目] [總額] 幫 [名字] [金額]
+    # Regex: (Date)? (Item) (Total) 幫 (Name) (Amount)
+    pattern_split_explicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(.+?)\s*(\d+)$'
+    
+    # 格式2 (自動對象)：[日期] [項目] [總額] 幫 [金額]
+    # Regex: (Date)? (Item) (Total) 幫 (Amount)
+    pattern_split_implicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(\d+)$'
+    
+    match_explicit = re.match(pattern_split_explicit, msg)
+    match_implicit = re.match(pattern_split_implicit, msg)
+    
+    if match_explicit or match_implicit:
+        target_user_id = None
+        target_user_name = None
+        
+        # 解析 Regex 結果
+        if match_explicit:
+            date_str = match_explicit.group(1)
+            item = match_explicit.group(2).strip()
+            total_amount = int(match_explicit.group(3))
+            target_name_input = match_explicit.group(4).strip()
+            split_amount = int(match_explicit.group(5))
+            
+            target_user_id = get_user_id_by_name(target_name_input)
+            if target_user_id:
+                target_user_name = target_name_input
+            else:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到「{target_name_input}」！\n請確認對方有輸入「我是 {target_name_input}」註冊過。"))
+                return
+        else: # match_implicit
+            date_str = match_implicit.group(1)
+            item = match_implicit.group(2).strip()
+            total_amount = int(match_implicit.group(3))
+            split_amount = int(match_implicit.group(4))
+            
+            # 自動尋找另一半
+            target_user_id, target_user_name = get_partner_id(sender_id)
+            if not target_user_id:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法自動判斷對象！\n如果是多人使用，請指定名字：\n例如：晚餐 400 幫 老公 150"))
+                return
+
+        # 計算自己付的部分
+        self_amount = total_amount - split_amount
+        
+        # 處理時間
+        created_at_val = "now()"
+        display_date = "今天"
+        if date_str:
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+                created_at_val = f"'{date_str} 12:00:00'"
+                display_date = date_str
+            except ValueError:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 日期格式請用 YYYY-MM-DD"))
+                return
+
+        # 寫入資料庫 (兩筆)
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            sql = "INSERT INTO expenses (user_id, item, amount, created_at) VALUES (%s, %s, %s, " + created_at_val + ")" if created_at_val != "now()" else "INSERT INTO expenses (user_id, item, amount) VALUES (%s, %s, %s)"
+            
+            # 1. 記自己
+            cur.execute(sql, (sender_id, item, self_amount))
+            # 2. 記對方
+            cur.execute(sql, (target_user_id, item, split_amount))
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            sender_name = get_user_name(sender_id)
+            
+            reply_text = (
+                f"✅ 自動拆帳完成！\n"
+                f"📅 時間：{display_date}\n"
+                f"🛒 項目：{item} (總額 ${total_amount})\n"
+                f"----------------\n"
+                f"👤 {sender_name}：${self_amount}\n"
+                f"👤 {target_user_name}：${split_amount}"
+            )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            
+        except Exception as e:
+            app.logger.error(f"DB Error: {e}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 拆帳失敗，資料庫錯誤"))
+        return
+
+
+    # === 功能 C：一般記帳 (包含幫別人記全額) ===
+    # Regex 解析：(Date)? (Item or Name+Item) (Amount)
+    pattern_general = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)$'
+    match = re.match(pattern_general, msg)
     
     if match:
         date_str = match.group(1)
         text_content = match.group(2).strip()
         amount = int(match.group(3))
         
-        # 1. 判斷是「記自己」還是「幫別人」
-        # 我們把 text_content 拆開來看第一個詞是不是人名
-        # 例如：text_content = "老公 飲料" -> tokens = ["老公", "飲料"]
+        # 1. 判斷是「記自己」還是「幫別人記全額」
         tokens = text_content.split(None, 1)
-        
         final_user_id = sender_id
-        item = text_content # 預設整個文字都是項目 (例如: "珍珠 奶茶")
+        item = text_content 
         
-        # 如果 text_content 包含空格 (有兩個以上的詞)
         if len(tokens) == 2:
             possible_name = tokens[0]
             remaining_text = tokens[1]
-            
-            # 查查看第一個詞是不是已註冊的名字
             found_id = get_user_id_by_name(possible_name)
             if found_id:
                 final_user_id = found_id
-                item = remaining_text # 項目就是剩下的字
-                # 找到了！這就是「幫別人記」模式
-            else:
-                # 沒找到名字，那就代表這只是普通的項目名稱 (例如: "珍珠 奶茶")
-                pass
+                item = remaining_text 
 
-        # 2. 決定時間 (指定日期 or 自動現在)
-        created_at_val = "now()" # 預設為 SQL 的 now()，自動記錄當下
+        # 2. 決定時間
+        created_at_val = "now()" 
         display_date = "今天"
-        
         if date_str:
             try:
-                # 嘗試解析日期
-                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                datetime.strptime(date_str, "%Y-%m-%d")
                 created_at_val = f"'{date_str} 12:00:00'" 
                 display_date = date_str
             except ValueError:
-                # 如果日期格式不對，視為普通文字記帳失敗? 或是提示? 
-                # 這裡簡單回覆提示
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 日期格式請用 YYYY-MM-DD"))
                 return
 
@@ -219,7 +338,6 @@ def handle_message(event):
                 
             conn.commit()
             
-            # 取得顯示用的名字
             final_user_name = get_user_name(final_user_id)
             if final_user_id == sender_id:
                 final_user_name = "你" 
@@ -235,13 +353,13 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 記帳失敗，資料庫出錯了。"))
         return
 
-    # === 功能 C：查詢結算 (列出明細 + 統計) ===
+    # === 功能 D：查詢結算 (列出明細 + 統計) ===
     if msg == "結算":
         try:
             conn = get_db_connection()
             cur = conn.cursor()
             
-            # 1. 撈取詳細明細 (依時間排序)
+            # 1. 撈取詳細明細
             cur.execute("""
                 SELECT e.created_at, e.user_id, e.item, e.amount 
                 FROM expenses e 
@@ -263,20 +381,18 @@ def handle_message(event):
             
             # === 產生詳細清單 ===
             reply_text = "📝 消費明細：\n"
-            spending_map = {} # user_id -> total_amount
+            spending_map = {} 
             total_all = 0
             
             for row in details:
-                dt = row[0] # datetime object
+                dt = row[0]
                 uid = row[1]
                 item = row[2]
                 amt = row[3]
                 
-                # 累加總額
                 total_all += amt
                 spending_map[uid] = spending_map.get(uid, 0) + amt
                 
-                # 格式化日期時間 (MM/DD HH:MM)
                 date_str = dt.strftime("%m/%d %H:%M")
                 name = user_map.get(uid, get_user_name(uid))
                 
@@ -285,12 +401,10 @@ def handle_message(event):
             reply_text += "----------------\n"
             reply_text += f"💰 總支出: ${total_all}\n"
             
-            # 確保分母包含所有註冊用戶
             for uid in user_map:
                 if uid not in spending_map:
                     spending_map[uid] = 0
 
-            # === 各人統計 (移除平均與建議) ===
             reply_text += "👤 各人統計：\n"
             for uid, amt in spending_map.items():
                 name = user_map.get(uid, get_user_name(uid))
@@ -303,7 +417,7 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 結算發生錯誤"))
         return
 
-    # === 功能 D：清除所有資料 (指令：清除) ===
+    # === 功能 E：清除所有資料 (指令：清除) ===
     if msg == "清除":
         try:
             conn = get_db_connection()
