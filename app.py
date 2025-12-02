@@ -31,16 +31,16 @@ WELCOME_MSG = (
     "1. 記自己 (最常用)：\n"
     "   • 晚餐 200\n"
     "   • 飲料50 (不用空格也行)\n\n"
-    "2. 自動拆帳 (新功能 ✨)：\n"
+    "2. 自動拆帳：\n"
     "   • 晚餐 400 幫 150\n"
     "     (總額400，其中150幫對方付)\n"
     "   • 晚餐 400 幫 老公 150\n\n"
     "3. 幫對方記 (全額)：\n"
     "   • 老公 飲料 50\n\n"
-    "4. 補舊帳：\n"
-    "   • 2023-12-01 午餐 150\n\n"
-    "5. 查詢與管理：\n"
-    "   • 結算：查看清單與總額\n"
+    "4. 結算功能 (✨更新)：\n"
+    "   • 結算：查看所有人明細\n"
+    "   • 老公 結算：只看老公的明細\n\n"
+    "5. 其他：\n"
     "   • 清除：刪除資料重新開始\n"
     "   • 說明：顯示此教學"
 )
@@ -200,12 +200,7 @@ def handle_message(event):
         return
 
     # === 功能 B：自動拆帳 (優先判斷) ===
-    # 格式1 (指定對象)：[日期] [項目] [總額] 幫 [名字] [金額]
-    # Regex: (Date)? (Item) (Total) 幫 (Name) (Amount)
     pattern_split_explicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(.+?)\s*(\d+)$'
-    
-    # 格式2 (自動對象)：[日期] [項目] [總額] 幫 [金額]
-    # Regex: (Date)? (Item) (Total) 幫 (Amount)
     pattern_split_implicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(\d+)$'
     
     match_explicit = re.match(pattern_split_explicit, msg)
@@ -215,8 +210,19 @@ def handle_message(event):
         target_user_id = None
         target_user_name = None
         
-        # 解析 Regex 結果
-        if match_explicit:
+        sender_name = get_user_name(sender_id)
+
+        if match_implicit:
+            date_str = match_implicit.group(1)
+            item = match_implicit.group(2).strip()
+            total_amount = int(match_implicit.group(3))
+            split_amount = int(match_implicit.group(4))
+            
+            target_user_id, target_user_name = get_partner_id(sender_id)
+            if not target_user_id:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法自動判斷對象！\n如果是多人使用，請指定名字：\n例如：晚餐 400 幫 老公 150"))
+                return
+        elif match_explicit:
             date_str = match_explicit.group(1)
             item = match_explicit.group(2).strip()
             total_amount = int(match_explicit.group(3))
@@ -229,22 +235,8 @@ def handle_message(event):
             else:
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到「{target_name_input}」！\n請確認對方有輸入「我是 {target_name_input}」註冊過。"))
                 return
-        else: # match_implicit
-            date_str = match_implicit.group(1)
-            item = match_implicit.group(2).strip()
-            total_amount = int(match_implicit.group(3))
-            split_amount = int(match_implicit.group(4))
-            
-            # 自動尋找另一半
-            target_user_id, target_user_name = get_partner_id(sender_id)
-            if not target_user_id:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法自動判斷對象！\n如果是多人使用，請指定名字：\n例如：晚餐 400 幫 老公 150"))
-                return
 
-        # 計算自己付的部分
         self_amount = total_amount - split_amount
-        
-        # 處理時間
         created_at_val = "now()"
         display_date = "今天"
         if date_str:
@@ -256,23 +248,19 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 日期格式請用 YYYY-MM-DD"))
                 return
 
-        # 寫入資料庫 (兩筆)
         try:
             conn = get_db_connection()
             cur = conn.cursor()
             
             sql = "INSERT INTO expenses (user_id, item, amount, created_at) VALUES (%s, %s, %s, " + created_at_val + ")" if created_at_val != "now()" else "INSERT INTO expenses (user_id, item, amount) VALUES (%s, %s, %s)"
             
-            # 1. 記自己
             cur.execute(sql, (sender_id, item, self_amount))
-            # 2. 記對方
-            cur.execute(sql, (target_user_id, item, split_amount))
+            note_item = f"{item} (需給{sender_name})"
+            cur.execute(sql, (target_user_id, note_item, split_amount))
             
             conn.commit()
             cur.close()
             conn.close()
-            
-            sender_name = get_user_name(sender_id)
             
             reply_text = (
                 f"✅ 自動拆帳完成！\n"
@@ -291,7 +279,6 @@ def handle_message(event):
 
 
     # === 功能 C：一般記帳 (包含幫別人記全額) ===
-    # Regex 解析：(Date)? (Item or Name+Item) (Amount)
     pattern_general = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)$'
     match = re.match(pattern_general, msg)
     
@@ -300,7 +287,6 @@ def handle_message(event):
         text_content = match.group(2).strip()
         amount = int(match.group(3))
         
-        # 1. 判斷是「記自己」還是「幫別人記全額」
         tokens = text_content.split(None, 1)
         final_user_id = sender_id
         item = text_content 
@@ -313,7 +299,6 @@ def handle_message(event):
                 final_user_id = found_id
                 item = remaining_text 
 
-        # 2. 決定時間
         created_at_val = "now()" 
         display_date = "今天"
         if date_str:
@@ -325,7 +310,6 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 日期格式請用 YYYY-MM-DD"))
                 return
 
-        # 3. 寫入資料庫
         try:
             conn = get_db_connection()
             cur = conn.cursor()
@@ -350,7 +334,7 @@ def handle_message(event):
             cur.close()
             conn.close()
             
-            reply_msg = f"✅ 記帳成功！\n👤 付款：{final_user_name}\n🛒 項目：{item}\n💰 金額：${amount}"
+            reply_msg = f"✅ 已記錄！\n📅 時間：{display_date}\n👤 付款：{final_user_name}\n🛒 項目：{item}\n💰 金額：${amount}"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
             
         except Exception as e:
@@ -358,63 +342,103 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 記帳失敗，資料庫出錯了。"))
         return
 
-    # === 功能 D：查詢結算 (列出明細 + 統計) ===
-    if msg == "結算":
+    # === 功能 D：查詢結算 (全體 or 個人) ===
+    # Regex: (Name)?\s*結算
+    match_settle = re.match(r'^(?:(.+?)\s*)?結算$', msg)
+    
+    if match_settle:
+        specific_name = match_settle.group(1) # None if "結算", "Name" if "Name 結算"
+        
         try:
             conn = get_db_connection()
             cur = conn.cursor()
             
-            # 1. 撈取詳細明細
-            cur.execute("""
-                SELECT e.created_at, e.user_id, e.item, e.amount 
-                FROM expenses e 
-                ORDER BY e.created_at ASC
-            """)
-            details = cur.fetchall()
-            
-            # 2. 撈取所有用戶名
-            cur.execute("SELECT user_id, display_name FROM users")
-            users_raw = cur.fetchall()
-            user_map = {u[0]: u[1] for u in users_raw}
-            
+            if specific_name:
+                # --- 個人結算 ---
+                target_uid = get_user_id_by_name(specific_name)
+                # Allow "我 結算"
+                if specific_name == "我":
+                    target_uid = sender_id
+                    specific_name = get_user_name(sender_id)
+
+                if not target_uid:
+                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到「{specific_name}」！請確認名字有註冊過。"))
+                     return
+
+                cur.execute("""
+                    SELECT created_at, item, amount 
+                    FROM expenses 
+                    WHERE user_id = %s
+                    ORDER BY created_at ASC
+                """, (target_uid,))
+                details = cur.fetchall()
+                
+                if not details:
+                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"👤 {specific_name} 目前還沒有消費紀錄喔！"))
+                     return
+
+                reply_text = f"👤 {specific_name} 的消費明細：\n"
+                total = 0
+                for row in details:
+                    dt = row[0]
+                    item = row[1]
+                    amt = row[2]
+                    total += amt
+                    date_str = dt.strftime("%m/%d %H:%M")
+                    reply_text += f"{date_str}: {item} ${amt}\n"
+                
+                reply_text += "----------------\n"
+                reply_text += f"💰 個人總支出: ${total}"
+
+            else:
+                # --- 全體結算 ---
+                cur.execute("""
+                    SELECT e.created_at, e.user_id, e.item, e.amount 
+                    FROM expenses e 
+                    ORDER BY e.created_at ASC
+                """)
+                details = cur.fetchall()
+                
+                cur.execute("SELECT user_id, display_name FROM users")
+                users_raw = cur.fetchall()
+                user_map = {u[0]: u[1] for u in users_raw}
+                
+                if not details:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前還沒有任何消費紀錄喔！"))
+                    return
+                
+                reply_text = "📝 全體消費明細：\n"
+                spending_map = {} 
+                total_all = 0
+                
+                for row in details:
+                    dt = row[0]
+                    uid = row[1]
+                    item = row[2]
+                    amt = row[3]
+                    
+                    total_all += amt
+                    spending_map[uid] = spending_map.get(uid, 0) + amt
+                    
+                    date_str = dt.strftime("%m/%d %H:%M")
+                    name = user_map.get(uid, get_user_name(uid))
+                    
+                    reply_text += f"{date_str} {name}: {item} ${amt}\n"
+                
+                reply_text += "----------------\n"
+                reply_text += f"💰 總支出: ${total_all}\n"
+                
+                for uid in user_map:
+                    if uid not in spending_map:
+                        spending_map[uid] = 0
+
+                reply_text += "👤 各人統計：\n"
+                for uid, amt in spending_map.items():
+                    name = user_map.get(uid, get_user_name(uid))
+                    reply_text += f"{name}: ${amt}\n"
+
             cur.close()
             conn.close()
-            
-            if not details:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前還沒有任何消費紀錄喔！"))
-                return
-            
-            # === 產生詳細清單 ===
-            reply_text = "📝 消費明細：\n"
-            spending_map = {} 
-            total_all = 0
-            
-            for row in details:
-                dt = row[0]
-                uid = row[1]
-                item = row[2]
-                amt = row[3]
-                
-                total_all += amt
-                spending_map[uid] = spending_map.get(uid, 0) + amt
-                
-                date_str = dt.strftime("%m/%d %H:%M")
-                name = user_map.get(uid, get_user_name(uid))
-                
-                reply_text += f"{date_str} {name}: {item} ${amt}\n"
-            
-            reply_text += "----------------\n"
-            reply_text += f"💰 總支出: ${total_all}\n"
-            
-            for uid in user_map:
-                if uid not in spending_map:
-                    spending_map[uid] = 0
-
-            reply_text += "👤 各人統計：\n"
-            for uid, amt in spending_map.items():
-                name = user_map.get(uid, get_user_name(uid))
-                reply_text += f"{name}: ${amt}\n"
-
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
         except Exception as e:
