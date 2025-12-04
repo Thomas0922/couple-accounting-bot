@@ -30,18 +30,17 @@ WELCOME_MSG = (
     "📝 【指令大全】\n"
     "1. 記自己 (最常用)：\n"
     "   • 晚餐 200\n"
-    "   • 飲料50 (不用空格也行)\n\n"
+    "   • 飲料50 (不用空格)\n\n"
     "2. 自動拆帳：\n"
-    "   • 晚餐 400 幫 150\n"
-    "     (總額400，其中150幫對方付)\n"
-    "   • 晚餐 400 幫 老公 150\n\n"
-    "3. 幫對方記 (全額)：\n"
-    "   • 老公 飲料 50\n\n"
-    "4. 結算功能 (✨更新)：\n"
-    "   • 結算：查看所有人明細\n"
-    "   • 老公 結算：只看老公的明細\n\n"
+    "   • 晚餐 400 幫 150\n\n"
+    "3. 結算與查詢：\n"
+    "   • 結算：看所有人明細\n"
+    "   • 老公 結算：只看老公的\n\n"
+    "4. 修改與刪除 (✨新功能)：\n"
+    "   • 移除 飲料：刪除最新一筆「飲料」\n"
+    "   • 移除最後一筆：刪除剛剛記的那筆\n"
+    "   • 清除：全部刪光光\n\n"
     "5. 其他：\n"
-    "   • 清除：刪除資料重新開始\n"
     "   • 說明：顯示此教學"
 )
 
@@ -199,6 +198,62 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 設定失敗，請稍後再試。"))
         return
 
+    # === 功能：移除項目 ===
+    # 1. 移除最後一筆
+    if msg == "移除最後一筆":
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT id, user_id, amount, item, created_at FROM expenses ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                cur.execute("DELETE FROM expenses WHERE id = %s", (row[0],))
+                conn.commit()
+                name = get_user_name(row[1])
+                date_str = row[4].strftime("%m/%d")
+                reply_text = f"🗑️ 已移除最新一筆紀錄：\n{date_str} {name}: {row[3]} ${row[2]}"
+            else:
+                reply_text = "📭 目前沒有任何紀錄可以移除喔！"
+            cur.close()
+            conn.close()
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        except Exception as e:
+            app.logger.error(f"DB Error: {e}")
+        return
+
+    # 2. 移除指定項目 (移除最新的一筆符合項目的)
+    match_remove = re.match(r'^移除\s+(.+)$', msg)
+    if match_remove:
+        item_to_remove = match_remove.group(1).strip()
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            # 找最新的一筆符合該名稱的
+            cur.execute("""
+                SELECT id, user_id, amount, created_at 
+                FROM expenses 
+                WHERE item = %s 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            """, (item_to_remove,))
+            row = cur.fetchone()
+            
+            if row:
+                cur.execute("DELETE FROM expenses WHERE id = %s", (row[0],))
+                conn.commit()
+                name = get_user_name(row[1])
+                date_str = row[3].strftime("%m/%d")
+                reply_text = f"🗑️ 已移除：\n{date_str} {name}: {item_to_remove} ${row[2]}"
+            else:
+                reply_text = f"❌ 找不到名稱為「{item_to_remove}」的紀錄！"
+            
+            cur.close()
+            conn.close()
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        except Exception as e:
+            app.logger.error(f"DB Error: {e}")
+        return
+
     # === 功能 B：自動拆帳 (優先判斷) ===
     pattern_split_explicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(.+?)\s*(\d+)$'
     pattern_split_implicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(\d+)$'
@@ -209,7 +264,6 @@ def handle_message(event):
     if match_explicit or match_implicit:
         target_user_id = None
         target_user_name = None
-        
         sender_name = get_user_name(sender_id)
 
         if match_implicit:
@@ -384,7 +438,8 @@ def handle_message(event):
                     item = row[1]
                     amt = row[2]
                     total += amt
-                    date_str = dt.strftime("%m/%d %H:%M")
+                    # 只顯示 MM/DD
+                    date_str = dt.strftime("%m/%d")
                     reply_text += f"{date_str}: {item} ${amt}\n"
                 
                 reply_text += "----------------\n"
@@ -420,7 +475,8 @@ def handle_message(event):
                     total_all += amt
                     spending_map[uid] = spending_map.get(uid, 0) + amt
                     
-                    date_str = dt.strftime("%m/%d %H:%M")
+                    # 只顯示 MM/DD
+                    date_str = dt.strftime("%m/%d")
                     name = user_map.get(uid, get_user_name(uid))
                     
                     reply_text += f"{date_str} {name}: {item} ${amt}\n"
