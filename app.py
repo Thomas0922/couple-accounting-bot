@@ -679,6 +679,15 @@ def handle_message(event):
             if conn:
                 return_db_connection(conn)
         return
+    
+    # === 預設回覆：當訊息不符合任何指令時 ===
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(
+            text="❓ 我不太懂你的意思\n請點選下方按鈕或輸入「說明」查看指令",
+            quick_reply=create_quick_reply_buttons()
+        )
+    )
 
 @app.route("/", methods=['GET'])
 def health_check():
