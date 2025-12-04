@@ -49,8 +49,15 @@ def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-# === 3. 初始化資料庫 (自動建立使用者表) ===
+# === 3. 延遲初始化資料庫（加快冷啟動） ===
+_db_initialized = False
+
 def init_db():
+    """初始化資料庫表"""
+    global _db_initialized
+    if _db_initialized:
+        return
+        
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -74,13 +81,10 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        print("資料庫初始化完成！")
+        _db_initialized = True
+        app.logger.info("資料庫初始化完成！")
     except Exception as e:
-        print(f"資料庫初始化失敗: {e}")
-
-# 應用程式啟動時執行一次初始化
-with app.app_context():
-    init_db()
+        app.logger.error(f"資料庫初始化失敗: {e}")
 
 # === 4. 輔助函式 ===
 # 取得用戶顯示名稱 (User ID -> Name)
@@ -139,6 +143,9 @@ def get_partner_id(my_user_id):
 
 @app.route("/callback", methods=['POST'])
 def callback():
+    # 確保資料庫已初始化
+    init_db()
+    
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     app.logger.info(f"Request body: {body}")
@@ -518,6 +525,8 @@ def handle_message(event):
 
 @app.route("/", methods=['GET'])
 def health_check():
+    """健康檢查端點，用於定時 ping"""
+    init_db()  # 確保資料庫已初始化
     return "Bot is running!", 200
 
 if __name__ == "__main__":
