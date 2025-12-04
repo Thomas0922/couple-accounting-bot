@@ -7,7 +7,10 @@ from datetime import datetime
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, FollowEvent
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage, JoinEvent, FollowEvent,
+    QuickReply, QuickReplyButton, MessageAction
+)
 
 # 設定 Log 顯示 (方便除錯)
 logging.basicConfig(level=logging.INFO)
@@ -74,8 +77,48 @@ WELCOME_MSG = (
     "   • 移除最後一筆：刪除剛剛記的那筆\n"
     "   • 清除：全部刪光光\n\n"
     "5. 其他：\n"
-    "   • 說明：顯示此教學"
+    "   • 說明：顯示此教學\n\n"
+    "💡 小技巧：使用下方快速按鈕更方便！"
 )
+
+# === 🎨 Quick Reply 功能（簡化版）===
+def create_quick_reply_buttons():
+    """建立簡化版快速回覆按鈕"""
+    buttons = [
+        QuickReplyButton(
+            action=MessageAction(label="結算", text="結算")
+        ),
+        QuickReplyButton(
+            action=MessageAction(label="說明", text="說明")
+        ),
+        QuickReplyButton(
+            action=MessageAction(label="移除最後一筆", text="移除最後一筆")
+        )
+    ]
+    
+    # 動態加入使用者個人結算按鈕
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT display_name FROM users ORDER BY user_id LIMIT 2")
+        users = cur.fetchall()
+        cur.close()
+        return_db_connection(conn)
+        
+        for user in users:
+            user_name = user[0]
+            buttons.append(
+                QuickReplyButton(
+                    action=MessageAction(
+                        label=f"{user_name} 結算", 
+                        text=f"{user_name} 結算"
+                    )
+                )
+            )
+    except Exception as e:
+        app.logger.error(f"建立快速按鈕失敗: {e}")
+    
+    return QuickReply(items=buttons)
 
 # === 3. 延遲初始化資料庫（加快冷啟動） ===
 _db_initialized = False
@@ -136,7 +179,6 @@ def init_db():
             return_db_connection(conn)
 
 # === 4. 輔助函式 ===
-# 取得用戶顯示名稱 (User ID -> Name) - 優化版
 def get_user_name(user_id, conn=None):
     """取得用戶名稱（可重用連線）"""
     should_close = False
@@ -158,14 +200,12 @@ def get_user_name(user_id, conn=None):
         if should_close:
             return_db_connection(conn)
     
-    # 資料庫沒有，試著問 LINE
     try:
         profile = line_bot_api.get_profile(user_id)
         return profile.display_name
     except:
         return f"用戶({user_id[:4]})"
 
-# 取得用戶 ID (Name -> User ID)
 def get_user_id_by_name(name):
     conn = None
     try:
@@ -183,7 +223,6 @@ def get_user_id_by_name(name):
             return_db_connection(conn)
     return None
 
-# 取得「另一半」的 ID
 def get_partner_id(my_user_id):
     conn = None
     try:
@@ -204,7 +243,7 @@ def get_partner_id(my_user_id):
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    init_db()  # 確保資料庫已初始化
+    init_db()
     
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
@@ -219,28 +258,49 @@ def callback():
 
 @handler.add(FollowEvent)
 def handle_follow(event):
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
+    line_bot_api.reply_message(
+        event.reply_token, 
+        TextSendMessage(
+            text=WELCOME_MSG,
+            quick_reply=create_quick_reply_buttons()
+        )
+    )
 
 @handler.add(JoinEvent)
 def handle_join(event):
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
+    line_bot_api.reply_message(
+        event.reply_token, 
+        TextSendMessage(
+            text=WELCOME_MSG,
+            quick_reply=create_quick_reply_buttons()
+        )
+    )
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     msg = event.message.text.strip()
     sender_id = event.source.user_id
 
-    # === 功能：小彩蛋 ===
     if msg == "我愛你":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我也愛你們爸爸媽媽 ❤️"))
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(
+                text="我也愛你們爸爸媽媽 ❤️",
+                quick_reply=create_quick_reply_buttons()
+            )
+        )
         return
 
-    # === 功能：顯示說明指令 ===
     if msg in ["說明", "指令", "help", "Help"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=WELCOME_MSG))
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(
+                text=WELCOME_MSG,
+                quick_reply=create_quick_reply_buttons()
+            )
+        )
         return
     
-    # === 功能 A：註冊名字 ===
     if msg.startswith("我是"):
         name = msg[2:].strip()
         if name:
@@ -256,7 +316,13 @@ def handle_message(event):
                 """, (sender_id, name))
                 conn.commit()
                 cur.close()
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 歡迎 {name}！已記住你的名字。"))
+                line_bot_api.reply_message(
+                    event.reply_token, 
+                    TextSendMessage(
+                        text=f"✅ 歡迎 {name}！已記住你的名字。",
+                        quick_reply=create_quick_reply_buttons()
+                    )
+                )
             except Exception as e:
                 app.logger.error(f"設定名字失敗: {e}")
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 設定失敗，請稍後再試。"))
@@ -265,7 +331,6 @@ def handle_message(event):
                     return_db_connection(conn)
         return
 
-    # === 功能：移除項目 ===
     if msg == "移除最後一筆":
         conn = None
         try:
@@ -282,7 +347,13 @@ def handle_message(event):
             else:
                 reply_text = "📭 目前沒有任何紀錄可以移除喔！"
             cur.close()
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(
+                    text=reply_text,
+                    quick_reply=create_quick_reply_buttons()
+                )
+            )
         except Exception as e:
             app.logger.error(f"DB Error: {e}")
         finally:
@@ -316,7 +387,13 @@ def handle_message(event):
                 reply_text = f"❌ 找不到名稱為「{item_to_remove}」的紀錄！"
             
             cur.close()
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(
+                    text=reply_text,
+                    quick_reply=create_quick_reply_buttons()
+                )
+            )
         except Exception as e:
             app.logger.error(f"DB Error: {e}")
         finally:
@@ -324,7 +401,6 @@ def handle_message(event):
                 return_db_connection(conn)
         return
 
-    # === 功能 B：自動拆帳 ===
     pattern_split_explicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(.+?)\s*(\d+)$'
     pattern_split_implicit = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)\s*幫\s*(\d+)$'
     
@@ -394,7 +470,13 @@ def handle_message(event):
                 f"👤 {sender_name}：${self_amount}\n"
                 f"👤 {target_user_name}：${split_amount}"
             )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(
+                    text=reply_text,
+                    quick_reply=create_quick_reply_buttons()
+                )
+            )
             
         except Exception as e:
             app.logger.error(f"DB Error: {e}")
@@ -404,7 +486,6 @@ def handle_message(event):
                 return_db_connection(conn)
         return
 
-    # === 功能 C：一般記帳 ===
     pattern_general = r'^(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*)?(.+?)\s*(\d+)$'
     match = re.match(pattern_general, msg)
     
@@ -461,7 +542,13 @@ def handle_message(event):
             cur.close()
             
             reply_msg = f"✅ 已記錄！\n📅 時間：{display_date}\n👤 付款：{final_user_name}\n🛒 項目：{item}\n💰 金額：${amount}"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(
+                    text=reply_msg,
+                    quick_reply=create_quick_reply_buttons()
+                )
+            )
             
         except Exception as e:
             app.logger.error(f"Database Error: {e}")
@@ -471,7 +558,6 @@ def handle_message(event):
                 return_db_connection(conn)
         return
 
-    # === 功能 D：查詢結算（🔥 效能優化版）===
     match_settle = re.match(r'^(?:(.+?)\s*)?結算$', msg)
     
     if match_settle:
@@ -483,7 +569,6 @@ def handle_message(event):
             cur = conn.cursor()
             
             if specific_name:
-                # --- 個人結算（優化版：使用 JOIN）---
                 target_uid = get_user_id_by_name(specific_name)
                 
                 if specific_name == "我":
@@ -494,7 +579,6 @@ def handle_message(event):
                      line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到「{specific_name}」！請確認名字有註冊過。"))
                      return
 
-                # 🔥 優化：一次查詢完成
                 cur.execute("""
                     SELECT created_at, item, amount 
                     FROM expenses 
@@ -504,7 +588,13 @@ def handle_message(event):
                 details = cur.fetchall()
                 
                 if not details:
-                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"👤 {specific_name} 目前還沒有消費紀錄喔！"))
+                     line_bot_api.reply_message(
+                         event.reply_token, 
+                         TextSendMessage(
+                             text=f"👤 {specific_name} 目前還沒有消費紀錄喔！",
+                             quick_reply=create_quick_reply_buttons()
+                         )
+                     )
                      return
 
                 reply_text = f"👤 {specific_name} 的消費明細：\n"
@@ -521,8 +611,6 @@ def handle_message(event):
                 reply_text += f"💰 個人總支出: ${total}"
 
             else:
-                # --- 全體結算（🔥 超級優化版）---
-                # 使用 JOIN 一次查詢完成，避免在迴圈中查詢
                 cur.execute("""
                     SELECT 
                         e.created_at, 
@@ -537,10 +625,15 @@ def handle_message(event):
                 details = cur.fetchall()
                 
                 if not details:
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前還沒有任何消費紀錄喔！"))
+                    line_bot_api.reply_message(
+                        event.reply_token, 
+                        TextSendMessage(
+                            text="目前還沒有任何消費紀錄喔！",
+                            quick_reply=create_quick_reply_buttons()
+                        )
+                    )
                     return
                 
-                # 🔥 優化：先取得所有用戶名稱
                 cur.execute("SELECT user_id, display_name FROM users")
                 users_raw = cur.fetchall()
                 user_map = {u[0]: u[1] for u in users_raw}
@@ -551,7 +644,7 @@ def handle_message(event):
                 
                 for row in details:
                     dt = row[0]
-                    name = row[1]  # 已經從 JOIN 取得
+                    name = row[1]
                     item = row[2]
                     amt = row[3]
                     uid = row[4]
@@ -565,7 +658,6 @@ def handle_message(event):
                 reply_text += "----------------\n"
                 reply_text += f"💰 總支出: ${total_all}\n"
                 
-                # 確保所有註冊用戶都顯示
                 for uid in user_map:
                     if uid not in spending_map:
                         spending_map[uid] = 0
@@ -576,7 +668,13 @@ def handle_message(event):
                     reply_text += f"{name}: ${amt}\n"
 
             cur.close()
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(
+                    text=reply_text,
+                    quick_reply=create_quick_reply_buttons()
+                )
+            )
 
         except Exception as e:
             app.logger.error(f"Error: {e}")
@@ -586,7 +684,6 @@ def handle_message(event):
                 return_db_connection(conn)
         return
 
-    # === 功能 E：清除所有資料 ===
     if msg == "清除":
         conn = None
         try:
@@ -595,7 +692,13 @@ def handle_message(event):
             cur.execute("DELETE FROM expenses")
             conn.commit()
             cur.close()
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🗑️ 已清除所有記帳資料！\n一切重新開始 ✨"))
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(
+                    text="🗑️ 已清除所有記帳資料！\n一切重新開始 ✨",
+                    quick_reply=create_quick_reply_buttons()
+                )
+            )
         except Exception as e:
             app.logger.error(f"DB Error: {e}")
         finally:
