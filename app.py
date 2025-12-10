@@ -256,19 +256,32 @@ def create_calendar_flex_message(year, month, conn):
     # 獲取該月份的資料
     first_day, num_days = monthrange(year, month)
     
-    # 查詢該月的每日消費
+    # 查詢該月的每日消費（按人分組）
     cur = conn.cursor()
     cur.execute("""
         SELECT 
-            DATE(created_at) as date,
-            SUM(amount) as total
-        FROM expenses
-        WHERE EXTRACT(YEAR FROM created_at) = %s
-        AND EXTRACT(MONTH FROM created_at) = %s
-        GROUP BY DATE(created_at)
+            DATE(e.created_at) as date,
+            COALESCE(u.display_name, e.user_id) as name,
+            SUM(e.amount) as total
+        FROM expenses e
+        LEFT JOIN users u ON e.user_id = u.user_id
+        WHERE EXTRACT(YEAR FROM e.created_at) = %s
+        AND EXTRACT(MONTH FROM e.created_at) = %s
+        GROUP BY DATE(e.created_at), u.display_name, e.user_id
+        ORDER BY date
     """, (year, month))
     
-    daily_totals = {str(row[0]): row[1] for row in cur.fetchall()}
+    daily_records = cur.fetchall()
+    
+    # 重組資料結構：{日期: {名字: 金額}}
+    daily_data = {}
+    for row in daily_records:
+        date_str = str(row[0])
+        name = row[1]
+        amount = row[2]
+        if date_str not in daily_data:
+            daily_data[date_str] = {}
+        daily_data[date_str][name] = amount
     
     # 計算總花費
     cur.execute("""
@@ -278,6 +291,26 @@ def create_calendar_flex_message(year, month, conn):
         AND EXTRACT(MONTH FROM created_at) = %s
     """, (year, month))
     monthly_total = cur.fetchone()[0] or 0
+    
+    # 獲取所有用戶（用於統計）
+    cur.execute("SELECT user_id, display_name FROM users")
+    users_list = cur.fetchall()
+    user_names = [u[1] for u in users_list]
+    
+    # 計算本月各人總消費
+    cur.execute("""
+        SELECT 
+            COALESCE(u.display_name, e.user_id) as name,
+            SUM(e.amount) as total
+        FROM expenses e
+        LEFT JOIN users u ON e.user_id = u.user_id
+        WHERE EXTRACT(YEAR FROM e.created_at) = %s
+        AND EXTRACT(MONTH FROM e.created_at) = %s
+        GROUP BY u.display_name, e.user_id
+        ORDER BY total DESC
+    """, (year, month))
+    
+    monthly_user_totals = cur.fetchall()
     
     cur.close()
     
@@ -326,31 +359,49 @@ def create_calendar_flex_message(year, month, conn):
             "layout": "vertical",
             "contents": [],
             "width": "40px",
-            "height": "40px"
+            "height": "55px"
         })
     
     # 填入日期
     for day in range(1, num_days + 1):
         date_str = f"{year}-{month:02d}-{day:02d}"
-        has_expense = date_str in daily_totals
+        has_expense = date_str in daily_data
+        
+        # 構建日期格子的內容
+        day_contents = [
+            {
+                "type": "text",
+                "text": str(day),
+                "size": "sm",
+                "align": "center",
+                "color": "#1DB446" if has_expense else "#666666",
+                "weight": "bold" if has_expense else "regular"
+            }
+        ]
+        
+        # 如果有消費記錄，顯示每個人的金額
+        if has_expense:
+            for name, amount in daily_data[date_str].items():
+                # 取名字的第一個字或前兩個字
+                short_name = name[:2] if len(name) > 1 else name
+                day_contents.append({
+                    "type": "text",
+                    "text": f"{short_name}${amount}",
+                    "size": "xxs",
+                    "align": "center",
+                    "color": "#1DB446",
+                    "margin": "none"
+                })
         
         day_box = {
             "type": "box",
             "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": str(day),
-                    "size": "sm",
-                    "align": "center",
-                    "color": "#1DB446" if has_expense else "#666666",
-                    "weight": "bold" if has_expense else "regular"
-                }
-            ],
+            "contents": day_contents,
             "width": "40px",
-            "height": "40px",
+            "height": "55px",
             "backgroundColor": "#E8F5E9" if has_expense else "#FFFFFF",
             "cornerRadius": "5px",
+            "paddingAll": "2px",
             "action": {
                 "type": "message",
                 "label": f"{month}/{day}",
@@ -378,13 +429,41 @@ def create_calendar_flex_message(year, month, conn):
                 "layout": "vertical",
                 "contents": [],
                 "width": "40px",
-                "height": "40px"
+                "height": "55px"
             })
         calendar_rows.append({
             "type": "box",
             "layout": "horizontal",
             "contents": current_row,
             "spacing": "sm"
+        })
+    
+    # 組合本月各人統計
+    user_stats_contents = []
+    for row in monthly_user_totals:
+        name = row[0]
+        total = row[1]
+        user_stats_contents.append({
+            "type": "box",
+            "layout": "baseline",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"👤 {name}:",
+                    "size": "sm",
+                    "color": "#666666",
+                    "flex": 0
+                },
+                {
+                    "type": "text",
+                    "text": f"${total}",
+                    "size": "sm",
+                    "color": "#1DB446",
+                    "align": "end",
+                    "weight": "bold"
+                }
+            ]
         })
     
     # 組合完整的 Flex Message
@@ -429,7 +508,8 @@ def create_calendar_flex_message(year, month, conn):
                                     "weight": "bold"
                                 }
                             ]
-                        },
+                        }
+                    ] + user_stats_contents + [
                         {
                             "type": "box",
                             "layout": "baseline",
