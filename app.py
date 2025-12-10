@@ -58,7 +58,8 @@ WELCOME_MSG = (
     "2. 自動拆帳：\n"
     "   • 晚餐 400 幫 150\n\n"
     "3. 結算與查詢：\n"
-    "   • 結算：看所有人明細\n"
+    "   • 結算：看簡易統計與欠款\n"
+    "   • 詳細結算：看所有消費明細\n"
     "   • 老公 結算：只看老公的\n\n"
     "4. 修改與刪除：\n"
     "   • 移除 飲料：刪除最新一筆「飲料」\n"
@@ -196,6 +197,54 @@ def get_partner_id(my_user_id):
         if conn:
             return_db_connection(conn)
     return None, None
+
+def calculate_debts(conn):
+    """
+    計算欠款關係
+    返回: {debtor_name: {creditor_name: amount}}
+    """
+    try:
+        cur = conn.cursor()
+        
+        # 獲取所有使用者映射
+        cur.execute("SELECT user_id, display_name FROM users")
+        users = {row[0]: row[1] for row in cur.fetchall()}
+        
+        # 查找所有包含 "(需給XXX)" 的項目
+        cur.execute("""
+            SELECT user_id, item, amount
+            FROM expenses
+            WHERE item LIKE '%(需給%)'
+        """)
+        
+        debt_records = cur.fetchall()
+        cur.close()
+        
+        # 初始化欠款字典
+        debts = {}
+        
+        # 解析每筆欠款記錄
+        for user_id, item, amount in debt_records:
+            # 提取債權人名字 (從 "項目 (需給XXX)" 中提取 XXX)
+            match = re.search(r'\(需給(.+?)\)', item)
+            if match:
+                creditor_name = match.group(1)
+                debtor_name = users.get(user_id, user_id)
+                
+                # 初始化債務人字典
+                if debtor_name not in debts:
+                    debts[debtor_name] = {}
+                
+                # 累加欠款
+                if creditor_name not in debts[debtor_name]:
+                    debts[debtor_name][creditor_name] = 0
+                debts[debtor_name][creditor_name] += amount
+        
+        return debts
+        
+    except Exception as e:
+        app.logger.error(f"計算欠款失敗: {e}")
+        return {}
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -522,16 +571,19 @@ def handle_message(event):
                 return_db_connection(conn)
         return
 
-    match_settle = re.match(r'^(?:(.+?)\s*)?結算$', msg)
+    # === 結算功能（支援簡易與詳細模式）===
+    match_settle = re.match(r'^(?:(.+?)\s*)?(詳細)?結算$', msg)
     
     if match_settle:
         specific_name = match_settle.group(1)
+        is_detailed = match_settle.group(2) == "詳細"
         conn = None
         
         try:
             conn = get_db_connection()
             cur = conn.cursor()
             
+            # === 個人結算 ===
             if specific_name:
                 target_uid = get_user_id_by_name(specific_name)
                 
@@ -580,6 +632,7 @@ def handle_message(event):
                 reply_text += "----------------\n"
                 reply_text += f"💰 個人總支出: ${total}"
 
+            # === 全體結算 ===
             else:
                 cur.execute("""
                     SELECT 
@@ -608,34 +661,102 @@ def handle_message(event):
                 users_raw = cur.fetchall()
                 user_map = {u[0]: u[1] for u in users_raw}
                 
-                reply_text = "📝 全體消費明細：\n"
                 spending_map = {}
                 total_all = 0
                 
+                # 計算各人總支出
                 for row in details:
-                    dt = row[0]
-                    name = row[1]
-                    item = row[2]
                     amt = row[3]
                     uid = row[4]
-                    
                     total_all += amt
                     spending_map[uid] = spending_map.get(uid, 0) + amt
-                    
-                    date_str = dt.strftime("%m/%d")
-                    reply_text += f"{date_str} {name}: {item} ${amt}\n"
                 
-                reply_text += "----------------\n"
-                reply_text += f"💰 總支出: ${total_all}\n"
-                
+                # 確保所有註冊用戶都在 spending_map 中
                 for uid in user_map:
                     if uid not in spending_map:
                         spending_map[uid] = 0
-
-                reply_text += "👤 各人統計：\n"
-                for uid, amt in spending_map.items():
-                    name = user_map.get(uid, get_user_name(uid, conn))
-                    reply_text += f"{name}: ${amt}\n"
+                
+                # 計算欠款
+                debts = calculate_debts(conn)
+                
+                # === 簡易模式（預設）===
+                if not is_detailed:
+                    reply_text = "📊 簡易結算報表\n"
+                    reply_text += "================\n"
+                    reply_text += f"💰 總支出: ${total_all}\n\n"
+                    
+                    reply_text += "👤 各人統計：\n"
+                    for uid, amt in spending_map.items():
+                        name = user_map.get(uid, get_user_name(uid, conn))
+                        reply_text += f"{name}: ${amt}\n"
+                    
+                    # 顯示欠款關係
+                    if debts:
+                        reply_text += "\n💳 欠款關係：\n"
+                        for debtor, creditors in debts.items():
+                            for creditor, amount in creditors.items():
+                                reply_text += f"{debtor} 欠 {creditor}: ${amount}\n"
+                    else:
+                        reply_text += "\n✨ 目前沒有未結清的欠款！"
+                    
+                    reply_text += "\n💡 輸入「詳細結算」查看完整明細"
+                
+                # === 詳細模式 ===
+                else:
+                    reply_text = "📝 詳細消費明細：\n"
+                    
+                    # 按日期分組
+                    daily_records = {}
+                    for row in details:
+                        dt = row[0]
+                        date_key = dt.strftime("%Y-%m-%d")
+                        if date_key not in daily_records:
+                            daily_records[date_key] = []
+                        daily_records[date_key].append(row)
+                    
+                    # 按日期排序（最近的在前）
+                    sorted_dates = sorted(daily_records.keys(), reverse=True)
+                    
+                    # 最多顯示最近 15 天
+                    display_dates = sorted_dates[:15]
+                    
+                    for date in display_dates:
+                        dt_obj = datetime.strptime(date, "%Y-%m-%d")
+                        date_display = dt_obj.strftime("%m/%d (%a)")
+                        
+                        # 日期標題
+                        reply_text += f"\n📅 {date_display}\n"
+                        reply_text += "─────────────\n"
+                        
+                        # 該日的所有記錄
+                        daily_total = 0
+                        for row in daily_records[date]:
+                            name = row[1]
+                            item = row[2]
+                            amt = row[3]
+                            daily_total += amt
+                            reply_text += f"  {name}: {item} ${amt}\n"
+                        
+                        # 每日小計
+                        reply_text += f"  💰 當日小計: ${daily_total}\n"
+                    
+                    if len(sorted_dates) > 15:
+                        reply_text += f"\n... 還有 {len(sorted_dates) - 15} 天的記錄未顯示\n"
+                    
+                    reply_text += "\n================\n"
+                    reply_text += f"💰 總支出: ${total_all}\n\n"
+                    
+                    reply_text += "👤 各人統計：\n"
+                    for uid, amt in spending_map.items():
+                        name = user_map.get(uid, get_user_name(uid, conn))
+                        reply_text += f"  {name}: ${amt}\n"
+                    
+                    # 顯示欠款關係
+                    if debts:
+                        reply_text += "\n💳 欠款關係：\n"
+                        for debtor, creditors in debts.items():
+                            for creditor, amount in creditors.items():
+                                reply_text += f"  {debtor} 欠 {creditor}: ${amount}\n"
 
             cur.close()
             line_bot_api.reply_message(
