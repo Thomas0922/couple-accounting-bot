@@ -9,7 +9,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage, JoinEvent, FollowEvent,
-    QuickReply, QuickReplyButton, MessageAction
+    QuickReply, QuickReplyButton, MessageAction, FlexSendMessage
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +58,8 @@ WELCOME_MSG = (
     "2. 自動拆帳：\n"
     "   • 晚餐 400 幫 150\n\n"
     "3. 結算與查詢：\n"
-    "   • 結算：看所有人明細與欠款\n"
+    "   • 結算：顯示本月消費日曆\n"
+    "     （點擊日期查看當天明細）\n"
     "   • 老公 結算：只看老公的\n\n"
     "4. 修改與刪除：\n"
     "   • 移除 飲料：刪除最新一筆「飲料」\n"
@@ -198,6 +199,297 @@ def get_partner_id(my_user_id):
     return None, None
 
 def calculate_debts(conn):
+    """
+    計算欠款關係
+    返回: {debtor_name: {creditor_name: amount}}
+    """
+    try:
+        cur = conn.cursor()
+        
+        # 獲取所有使用者映射
+        cur.execute("SELECT user_id, display_name FROM users")
+        users = {row[0]: row[1] for row in cur.fetchall()}
+        
+        # 查找所有包含 "(需給XXX)" 的項目
+        cur.execute("""
+            SELECT user_id, item, amount
+            FROM expenses
+            WHERE item LIKE '%(需給%)'
+        """)
+        
+        debt_records = cur.fetchall()
+        cur.close()
+        
+        # 初始化欠款字典
+        debts = {}
+        
+        # 解析每筆欠款記錄
+        for user_id, item, amount in debt_records:
+            # 提取債權人名字 (從 "項目 (需給XXX)" 中提取 XXX)
+            match = re.search(r'\(需給(.+?)\)', item)
+            if match:
+                creditor_name = match.group(1)
+                debtor_name = users.get(user_id, user_id)
+                
+                # 初始化債務人字典
+                if debtor_name not in debts:
+                    debts[debtor_name] = {}
+                
+                # 累加欠款
+                if creditor_name not in debts[debtor_name]:
+                    debts[debtor_name][creditor_name] = 0
+                debts[debtor_name][creditor_name] += amount
+        
+        return debts
+        
+    except Exception as e:
+        app.logger.error(f"計算欠款失敗: {e}")
+        return {}
+
+def create_calendar_flex_message(year, month, conn):
+    """
+    創建月曆式的 Flex Message
+    """
+    from calendar import monthrange
+    import calendar as cal
+    
+    # 獲取該月份的資料
+    first_day, num_days = monthrange(year, month)
+    
+    # 查詢該月的每日消費
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+            DATE(created_at) as date,
+            SUM(amount) as total
+        FROM expenses
+        WHERE EXTRACT(YEAR FROM created_at) = %s
+        AND EXTRACT(MONTH FROM created_at) = %s
+        GROUP BY DATE(created_at)
+    """, (year, month))
+    
+    daily_totals = {str(row[0]): row[1] for row in cur.fetchall()}
+    
+    # 計算總花費
+    cur.execute("""
+        SELECT SUM(amount) as total
+        FROM expenses
+        WHERE EXTRACT(YEAR FROM created_at) = %s
+        AND EXTRACT(MONTH FROM created_at) = %s
+    """, (year, month))
+    monthly_total = cur.fetchone()[0] or 0
+    
+    cur.close()
+    
+    # 計算總欠款
+    debts = calculate_debts(conn)
+    total_debt_text = ""
+    if debts:
+        debt_lines = []
+        for debtor, creditors in debts.items():
+            for creditor, amount in creditors.items():
+                debt_lines.append(f"{debtor}欠{creditor} ${amount}")
+        total_debt_text = " | ".join(debt_lines)
+    else:
+        total_debt_text = "無未結清欠款"
+    
+    # 創建日曆格子
+    week_names = ["日", "一", "二", "三", "四", "五", "六"]
+    
+    # 標題列（星期）
+    header_boxes = []
+    for day_name in week_names:
+        header_boxes.append({
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": day_name,
+                    "size": "xs",
+                    "align": "center",
+                    "color": "#888888"
+                }
+            ],
+            "width": "40px",
+            "height": "20px"
+        })
+    
+    # 日期格子
+    calendar_rows = []
+    current_row = []
+    
+    # 補足第一週的空白
+    for i in range(first_day):
+        current_row.append({
+            "type": "box",
+            "layout": "vertical",
+            "contents": [],
+            "width": "40px",
+            "height": "40px"
+        })
+    
+    # 填入日期
+    for day in range(1, num_days + 1):
+        date_str = f"{year}-{month:02d}-{day:02d}"
+        has_expense = date_str in daily_totals
+        
+        day_box = {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": str(day),
+                    "size": "sm",
+                    "align": "center",
+                    "color": "#1DB446" if has_expense else "#666666",
+                    "weight": "bold" if has_expense else "regular"
+                }
+            ],
+            "width": "40px",
+            "height": "40px",
+            "backgroundColor": "#E8F5E9" if has_expense else "#FFFFFF",
+            "cornerRadius": "5px",
+            "action": {
+                "type": "message",
+                "label": f"{month}/{day}",
+                "text": f"{year}-{month:02d}-{day:02d} 查詢"
+            }
+        }
+        
+        current_row.append(day_box)
+        
+        # 每週六換行
+        if (first_day + day) % 7 == 0:
+            calendar_rows.append({
+                "type": "box",
+                "layout": "horizontal",
+                "contents": current_row,
+                "spacing": "sm"
+            })
+            current_row = []
+    
+    # 最後一行不滿7天的處理
+    if current_row:
+        while len(current_row) < 7:
+            current_row.append({
+                "type": "box",
+                "layout": "vertical",
+                "contents": [],
+                "width": "40px",
+                "height": "40px"
+            })
+        calendar_rows.append({
+            "type": "box",
+            "layout": "horizontal",
+            "contents": current_row,
+            "spacing": "sm"
+        })
+    
+    # 組合完整的 Flex Message
+    flex_content = {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"{year}年{month}月 消費日曆",
+                    "weight": "bold",
+                    "size": "lg",
+                    "align": "center",
+                    "color": "#1DB446"
+                },
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "margin": "md",
+                    "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "box",
+                            "layout": "baseline",
+                            "spacing": "sm",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": "💰 本月總花費:",
+                                    "size": "sm",
+                                    "color": "#666666",
+                                    "flex": 0
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"${monthly_total}",
+                                    "size": "sm",
+                                    "color": "#1DB446",
+                                    "align": "end",
+                                    "weight": "bold"
+                                }
+                            ]
+                        },
+                        {
+                            "type": "box",
+                            "layout": "baseline",
+                            "spacing": "sm",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": "💳 總欠款:",
+                                    "size": "sm",
+                                    "color": "#666666",
+                                    "flex": 0
+                                },
+                                {
+                                    "type": "text",
+                                    "text": total_debt_text,
+                                    "size": "xs",
+                                    "color": "#FF6B6B" if debts else "#1DB446",
+                                    "align": "end",
+                                    "wrap": True
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "type": "separator",
+                    "margin": "md"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": header_boxes,
+                    "spacing": "sm",
+                    "margin": "md"
+                },
+                {
+                    "type": "separator",
+                    "margin": "sm"
+                }
+            ] + calendar_rows + [
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "margin": "md",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "點擊日期查看當天詳細花費",
+                            "size": "xs",
+                            "color": "#888888",
+                            "align": "center"
+                        }
+                    ]
+                }
+            ],
+            "spacing": "sm"
+        }
+    }
+    
+    return FlexSendMessage(alt_text=f"{year}年{month}月消費日曆", contents=flex_content)
     """
     計算欠款關係
     返回: {debtor_name: {creditor_name: amount}}
@@ -570,7 +862,74 @@ def handle_message(event):
                 return_db_connection(conn)
         return
 
-    # === 結算功能（統一使用日期劃分）===
+    # === 日期查詢功能（從日曆點擊觸發）===
+    date_query_match = re.match(r'^(\d{4})-(\d{2})-(\d{2})\s*查詢$', msg)
+    if date_query_match:
+        query_year = int(date_query_match.group(1))
+        query_month = int(date_query_match.group(2))
+        query_day = int(date_query_match.group(3))
+        query_date = f"{query_year}-{query_month:02d}-{query_day:02d}"
+        
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            cur.execute("""
+                SELECT 
+                    COALESCE(u.display_name, e.user_id) as name,
+                    e.item, 
+                    e.amount
+                FROM expenses e
+                LEFT JOIN users u ON e.user_id = u.user_id
+                WHERE DATE(e.created_at) = %s
+                ORDER BY e.created_at ASC
+            """, (query_date,))
+            
+            details = cur.fetchall()
+            cur.close()
+            
+            if not details:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text=f"📅 {query_month}/{query_day}\n\n這天沒有消費記錄喔！",
+                        quick_reply=create_quick_reply_buttons()
+                    )
+                )
+                return
+            
+            reply_text = f"📅 {query_month}/{query_day} 消費明細\n"
+            reply_text += "─────────────\n"
+            
+            daily_total = 0
+            for row in details:
+                name = row[0]
+                item = row[1]
+                amt = row[2]
+                daily_total += amt
+                reply_text += f"{name}: {item} ${amt}\n"
+            
+            reply_text += "─────────────\n"
+            reply_text += f"💰 當日總計: ${daily_total}"
+            
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=reply_text, quick_reply=create_quick_reply_buttons())
+            )
+            
+        except Exception as e:
+            app.logger.error(f"日期查詢錯誤: {e}")
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="❌ 查詢失敗", quick_reply=create_quick_reply_buttons())
+            )
+        finally:
+            if conn:
+                return_db_connection(conn)
+        return
+
+    # === 結算功能（顯示月曆）===
     match_settle = re.match(r'^(?:(.+?)\s*)?結算$', msg)
     
     if match_settle:
@@ -685,111 +1044,27 @@ def handle_message(event):
                         reply_text += "\n✨ 目前沒有未結清的欠款！"
                 else:
                     reply_text += "\n✨ 目前沒有未結清的欠款！"
+                
+                cur.close()
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=reply_text, quick_reply=create_quick_reply_buttons())
+                )
 
-            # === 全體結算 ===
+            # === 全體結算（顯示月曆）===
             else:
-                cur.execute("""
-                    SELECT 
-                        e.created_at, 
-                        COALESCE(u.display_name, e.user_id) as name,
-                        e.item, 
-                        e.amount,
-                        e.user_id
-                    FROM expenses e
-                    LEFT JOIN users u ON e.user_id = u.user_id
-                    ORDER BY e.created_at DESC
-                """)
-                details = cur.fetchall()
+                # 獲取當前年月
+                now = datetime.now()
+                current_year = now.year
+                current_month = now.month
                 
-                if not details:
-                    line_bot_api.reply_message(
-                        event.reply_token, 
-                        TextSendMessage(
-                            text="目前還沒有任何消費紀錄喔！",
-                            quick_reply=create_quick_reply_buttons()
-                        )
-                    )
-                    return
+                # 生成月曆 Flex Message
+                calendar_message = create_calendar_flex_message(current_year, current_month, conn)
                 
-                cur.execute("SELECT user_id, display_name FROM users")
-                users_raw = cur.fetchall()
-                user_map = {u[0]: u[1] for u in users_raw}
-                
-                spending_map = {}
-                total_all = 0
-                
-                reply_text = "📝 全體消費明細\n"
-                
-                # 按日期分組
-                daily_records = {}
-                for row in details:
-                    dt = row[0]
-                    amt = row[3]
-                    uid = row[4]
-                    total_all += amt
-                    spending_map[uid] = spending_map.get(uid, 0) + amt
-                    
-                    date_key = dt.strftime("%Y-%m-%d")
-                    if date_key not in daily_records:
-                        daily_records[date_key] = []
-                    daily_records[date_key].append(row)
-                
-                # 確保所有註冊用戶都在 spending_map 中
-                for uid in user_map:
-                    if uid not in spending_map:
-                        spending_map[uid] = 0
-                
-                # 按日期排序（最近的在前）
-                sorted_dates = sorted(daily_records.keys(), reverse=True)
-                
-                # 最多顯示最近 15 天
-                display_dates = sorted_dates[:15]
-                
-                for date in display_dates:
-                    dt_obj = datetime.strptime(date, "%Y-%m-%d")
-                    date_display = dt_obj.strftime("%m/%d (%a)")
-                    
-                    # 日期標題
-                    reply_text += f"\n📅 {date_display}\n"
-                    reply_text += "─────────────\n"
-                    
-                    # 該日的所有記錄
-                    daily_total = 0
-                    for row in daily_records[date]:
-                        name = row[1]
-                        item = row[2]
-                        amt = row[3]
-                        daily_total += amt
-                        reply_text += f"  {name}: {item} ${amt}\n"
-                    
-                    # 每日小計
-                    reply_text += f"  💰 當日小計: ${daily_total}\n"
-                
-                if len(sorted_dates) > 15:
-                    reply_text += f"\n... 還有 {len(sorted_dates) - 15} 天的記錄未顯示\n"
-                
-                reply_text += "\n================\n"
-                reply_text += f"💰 總支出: ${total_all}\n\n"
-                
-                reply_text += "👤 各人統計：\n"
-                for uid, amt in spending_map.items():
-                    name = user_map.get(uid, get_user_name(uid, conn))
-                    reply_text += f"  {name}: ${amt}\n"
-                
-                # 顯示欠款關係
-                if debts:
-                    reply_text += "\n💳 欠款關係：\n"
-                    for debtor, creditors in debts.items():
-                        for creditor, amount in creditors.items():
-                            reply_text += f"  {debtor} 欠 {creditor}: ${amount}\n"
-                else:
-                    reply_text += "\n✨ 目前沒有未結清的欠款！"
-
-            cur.close()
-            line_bot_api.reply_message(
-                event.reply_token, 
-                TextSendMessage(text=reply_text, quick_reply=create_quick_reply_buttons())
-            )
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    calendar_message
+                )
 
         except Exception as e:
             app.logger.error(f"Error: {e}")
