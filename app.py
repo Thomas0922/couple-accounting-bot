@@ -200,8 +200,9 @@ def get_partner_id(my_user_id):
 
 def calculate_debts(conn):
     """
-    計算欠款關係
+    計算欠款關係並互相抵銷
     返回: {debtor_name: {creditor_name: amount}}
+    只返回抵銷後的淨欠款
     """
     try:
         cur = conn.cursor()
@@ -220,8 +221,8 @@ def calculate_debts(conn):
         debt_records = cur.fetchall()
         cur.close()
         
-        # 初始化欠款字典
-        debts = {}
+        # 初始化欠款矩陣（雙向記錄）
+        debt_matrix = {}
         
         # 解析每筆欠款記錄
         for user_id, item, amount in debt_records:
@@ -231,16 +232,51 @@ def calculate_debts(conn):
                 creditor_name = match.group(1)
                 debtor_name = users.get(user_id, user_id)
                 
-                # 初始化債務人字典
-                if debtor_name not in debts:
-                    debts[debtor_name] = {}
+                # 初始化
+                if debtor_name not in debt_matrix:
+                    debt_matrix[debtor_name] = {}
+                if creditor_name not in debt_matrix:
+                    debt_matrix[creditor_name] = {}
+                if creditor_name not in debt_matrix[debtor_name]:
+                    debt_matrix[debtor_name][creditor_name] = 0
+                if debtor_name not in debt_matrix[creditor_name]:
+                    debt_matrix[creditor_name][debtor_name] = 0
                 
                 # 累加欠款
-                if creditor_name not in debts[debtor_name]:
-                    debts[debtor_name][creditor_name] = 0
-                debts[debtor_name][creditor_name] += amount
+                debt_matrix[debtor_name][creditor_name] += amount
         
-        return debts
+        # 互相抵銷，計算淨欠款
+        net_debts = {}
+        processed_pairs = set()
+        
+        for debtor in debt_matrix:
+            for creditor in debt_matrix[debtor]:
+                # 避免重複處理同一對關係
+                pair = tuple(sorted([debtor, creditor]))
+                if pair in processed_pairs:
+                    continue
+                processed_pairs.add(pair)
+                
+                # 獲取雙向欠款金額
+                debt_a_to_b = debt_matrix.get(debtor, {}).get(creditor, 0)
+                debt_b_to_a = debt_matrix.get(creditor, {}).get(debtor, 0)
+                
+                # 計算淨欠款
+                net_amount = debt_a_to_b - debt_b_to_a
+                
+                if net_amount > 0:
+                    # debtor 欠 creditor
+                    if debtor not in net_debts:
+                        net_debts[debtor] = {}
+                    net_debts[debtor][creditor] = net_amount
+                elif net_amount < 0:
+                    # creditor 欠 debtor
+                    if creditor not in net_debts:
+                        net_debts[creditor] = {}
+                    net_debts[creditor][debtor] = abs(net_amount)
+                # net_amount == 0 表示互相抵銷完畢，不記錄
+        
+        return net_debts
         
     except Exception as e:
         app.logger.error(f"計算欠款失敗: {e}")
